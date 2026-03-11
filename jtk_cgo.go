@@ -28,7 +28,14 @@ typedef struct {
     } value;
 } JtkEvent;
 
-void JTK_Run(const char* module_name);
+typedef struct {
+    const char *path;
+    const unsigned char *data;
+    const size_t size;
+} EmbeddedAsset;
+
+void JTK_Run(const char* module_name, int argc, char** argv);
+void JTK_SetAssets(const EmbeddedAsset* assets);
 void JTK_State_Update(const char* path, int type, void* val_ptr);
 bool JTK_WaitEvent(JtkEvent* out_event);
 void JTK_FreeEvent(JtkEvent* event);
@@ -44,7 +51,10 @@ static char* get_event_string(JtkEvent* e) { return e->value.s_val; }
 */
 import "C"
 import (
+	"embed"
 	"fmt"
+	"io/fs"
+	"os"
 	"runtime"
 	"unsafe"
 )
@@ -112,11 +122,25 @@ func decodeEvent(e *C.JtkEvent) interface{} {
 }
 
 func Run(moduleName string) {
-	// Convert Go string to C string
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	cName := C.CString(moduleName)
 	defer C.free(unsafe.Pointer(cName))
 
-	C.JTK_Run(cName)
+	argc := C.int(len(os.Args))
+	argv := make([]*C.char, len(os.Args))
+	for i, arg := range os.Args {
+		argv[i] = C.CString(arg)
+		defer C.free(unsafe.Pointer(argv[i]))
+	}
+
+	var argvPtr **C.char
+	if len(argv) > 0 {
+		argvPtr = (**C.char)(unsafe.Pointer(&argv[0]))
+	}
+
+	C.JTK_Run(cName, argc, argvPtr)
 }
 
 func Update(path string, value interface{}) {
@@ -159,4 +183,42 @@ func Update(path string, value interface{}) {
 	default:
 		fmt.Printf("[JTK Go] Unsupported type for path '%s'\n", path)
 	}
+}
+
+// SetAssets извлекает файлы из embed.FS и передает их в C JTK.
+func SetAssets(efs embed.FS) {
+	var cAssets []C.EmbeddedAsset
+
+	// Обходим все файлы внутри заэмбеженной директории
+	fs.WalkDir(efs, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+
+		data, err := efs.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+
+		// Выделяем память в C (ВАЖНО: мы её НЕ освобождаем, так как C
+		// будет хранить указатели на эти ассеты до конца работы программы)
+		cPath := C.CString(path)
+		cData := (*C.uchar)(C.CBytes(data))
+		cSize := C.size_t(len(data))
+
+		cAssets = append(cAssets, C.EmbeddedAsset{
+			path: cPath,
+			data: cData,
+			size: cSize,
+		})
+
+		return nil
+	})
+
+	// Сишные API часто ожидают массив с нулевым элементом на конце как признак завершения,
+	// на всякий случай добавляем пустую структуру в конец
+	cAssets = append(cAssets, C.EmbeddedAsset{})
+
+	// Передаем указатель на первый элемент массива
+	C.JTK_SetAssets((*C.EmbeddedAsset)(unsafe.Pointer(&cAssets[0])))
 }
